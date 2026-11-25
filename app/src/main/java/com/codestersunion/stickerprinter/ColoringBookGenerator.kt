@@ -39,7 +39,7 @@ object ColoringBookGenerator {
     private const val TAG = "ColoringBookGenerator"
     private const val API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
     private const val TRANSCRIPTION_MODEL = "gemini-3.5-transcribe"
-    private const val COLORING_PAGE_MODEL = "gemini-3.1-flash-image"
+    private const val COLORING_PAGE_MODEL = "gemini-3.1-flash-lite-image"
     /** Fast, cheap text model used to understand what the child asked for. */
     private const val UNDERSTANDING_MODEL = "gemini-3.5-flash-lite"
 
