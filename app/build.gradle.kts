@@ -99,9 +99,6 @@ dependencies {
     // Extended icons for Mic
     implementation("androidx.compose.material:material-icons-extended")
     
-    // Google Generative AI SDK for image generation
-    implementation(libs.generativeai)
-    
     // Coil for image loading and handling
     implementation("io.coil-kt:coil:2.7.0")
     

@@ -408,7 +408,7 @@ fun SettingsScreen(
                             val result = PrinterHelper.printWizardSpiderHeroImage(
                                 deviceAddress = selectedDeviceAddress!!, 
                                 context = context, 
-                                R.drawable.wizard_spider_hero_2
+                                R.drawable.wizard_spider_hero
                             )
 
                             if (result.isSuccess) {
