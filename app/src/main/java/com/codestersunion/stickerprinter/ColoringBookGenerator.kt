@@ -23,15 +23,9 @@ import org.json.JSONObject
 class GeminiApiException(val statusCode: Int, val apiStatus: String?, message: String) :
     Exception("HTTP $statusCode${apiStatus?.let { " $it" } ?: ""}: $message")
 
-/** What the AI understood from a child's request. */
+/** A sticker to draw: what the child asked for, plus an optional short display name. */
 data class StickerIdea(
-    /** Cleaned-up, kid-safe description of what to draw. */
     val subject: String,
-    /** Short, friendly sentence shown to the child (used when the request wasn't understood). */
-    val reply: String,
-    /** False when the speech was noise or made no sense. */
-    val understood: Boolean,
-    /** Optional short name, e.g. "Skateboard Dragon". */
     val title: String? = null
 )
 
@@ -40,8 +34,6 @@ object ColoringBookGenerator {
     private const val API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
     private const val TRANSCRIPTION_MODEL = "gemini-3.5-transcribe"
     private const val COLORING_PAGE_MODEL = "gemini-3.1-flash-lite-image"
-    /** Fast, cheap text model used to understand what the child asked for. */
-    private const val UNDERSTANDING_MODEL = "gemini-3.5-flash-lite"
 
     private fun isValidKey(apiKey: String) =
         apiKey.isNotEmpty() && apiKey != "YOUR_GOOGLE_API_KEY_HERE"
@@ -91,85 +83,6 @@ object ColoringBookGenerator {
         Log.d(TAG, "Transcription: \"$text\"")
         text.ifEmpty { null }
     }
-
-    /**
-     * Turns a child's (often rambling, mumbled or half-finished) words into a clear,
-     * kid-safe drawing subject plus a short friendly sentence to show the child.
-     *
-     * Never throws: if the understanding model is unavailable we fall back to the raw
-     * transcript so a misconfigured model never blocks a sticker.
-     */
-    suspend fun interpretRequest(apiKey: String, transcript: String): StickerIdea =
-        withContext(Dispatchers.IO) {
-            val fallback = StickerIdea(
-                subject = transcript,
-                reply = "Ooh, ${transcript.trimEnd('.', '!', '?')}! Let me draw it!",
-                understood = true
-            )
-            if (!isValidKey(apiKey)) return@withContext fallback
-
-            val instructions = """
-                You help young children (ages 3-10) make black-and-white stickers by talking.
-                You get a speech transcript of what a child said. It may include filler words
-                ("um", "can I have", "I want"), repeats, baby talk, mispronunciations or
-                transcription mistakes. Figure out what the child most likely wants a picture of.
-
-                Rules:
-                - "subject": a short, vivid description of the picture to draw (max 25 words),
-                  keeping every detail the child asked for (characters, actions, numbers, names).
-                - If the child asked for words or a name on the sticker, include the exact
-                  spelling in quotes in the subject.
-                - If they say "anything", "surprise me", "I don't know", or similar, invent a fun,
-                  whimsical subject a child would love.
-                - If the request is scary, violent, gory, or not suitable for young kids, gently
-                  turn it into a friendly, silly version (e.g. "a monster eating people" ->
-                  "a goofy friendly monster eating a giant sandwich"). Never lecture.
-                - If the transcript is empty, just noise, or makes no sense at all, set
-                  "understood" to false.
-                - "reply": one short, excited sentence (max 12 words) for the child,
-                  using very simple words, e.g. "Ooh, a dragon on a skateboard! Let me draw it!"
-                  If not understood: "Hmm, I didn't catch that. Can you say it again?"
-                - "title": 1-4 word name for the sticker, e.g. "Skateboard Dragon".
-            """.trimIndent()
-
-            val requestBody = JSONObject()
-                .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", instructions))))
-                .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray().put(JSONObject().put("text", "Transcript: \"$transcript\"")))))
-                .put(
-                    "generationConfig",
-                    JSONObject()
-                        .put("responseMimeType", "application/json")
-                        .put(
-                            "responseSchema",
-                            JSONObject()
-                                .put("type", "OBJECT")
-                                .put(
-                                    "properties",
-                                    JSONObject()
-                                        .put("subject", JSONObject().put("type", "STRING"))
-                                        .put("title", JSONObject().put("type", "STRING"))
-                                        .put("reply", JSONObject().put("type", "STRING"))
-                                        .put("understood", JSONObject().put("type", "BOOLEAN"))
-                                )
-                                .put("required", JSONArray().put("subject").put("reply").put("understood"))
-                        )
-                )
-
-            try {
-                val json = JSONObject(
-                    extractTextFromGenerateContentResponse(postGenerateContent(apiKey, UNDERSTANDING_MODEL, requestBody))
-                )
-                StickerIdea(
-                    subject = json.optString("subject").ifBlank { transcript },
-                    reply = json.optString("reply").ifBlank { fallback.reply },
-                    understood = json.optBoolean("understood", true),
-                    title = json.optString("title").ifBlank { null }
-                ).also { Log.d(TAG, "Interpreted \"$transcript\" -> $it") }
-            } catch (e: Exception) {
-                Log.w(TAG, "Request interpretation failed, using raw transcript", e)
-                fallback
-            }
-        }
 
     /** Art styles rotated between generations so stickers don't all look the same. */
     private val STYLES = listOf(

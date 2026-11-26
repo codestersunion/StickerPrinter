@@ -81,6 +81,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
@@ -106,6 +107,7 @@ import com.codestersunion.stickerprinter.ui.theme.StickerPrinterTheme
 import com.codestersunion.stickerprinter.ui.theme.SunnyYellow
 import com.codestersunion.stickerprinter.ui.theme.SunnyYellowLight
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -121,9 +123,10 @@ enum class AppScreen {
     GALLERY     // Recent stickers that can be printed again
 }
 
-/** Ideas used by the "Surprise me!" button and the rotating "Try saying..." hint. */
+/** Ideas used by the "Surprise me!" button and the rotating "Try saying..." hint.
+ *  Emoji are limited to ones old Android versions (API 25) can draw. */
 private val STICKER_IDEAS = listOf(
-    "a dinosaur riding a skateboard" to "🦖",
+    "a dinosaur riding a skateboard" to "🦎",
     "a cat astronaut floating in space" to "🐱",
     "a unicorn eating a giant slice of pizza" to "🦄",
     "a robot baking cupcakes" to "🤖",
@@ -136,13 +139,13 @@ private val STICKER_IDEAS = listOf(
     "a bunny flying a hot air balloon" to "🐰",
     "a happy whale with a rainbow spout" to "🐳",
     "a lion wearing a crown and sunglasses" to "🦁",
-    "a mermaid riding a dolphin" to "🧜",
+    "a mermaid riding a dolphin" to "🐬",
     "an owl reading a big book" to "🦉",
     "a bear eating ice cream on the beach" to "🐻",
     "a frog prince on a lily pad" to "🐸",
     "a fire truck with a smiling face" to "🚒",
-    "a pirate ship full of cats" to "🏴‍☠️",
-    "a sloth hanging from a candy cane" to "🦥"
+    "a pirate ship full of cats" to "⛵",
+    "a sloth hanging from a candy cane" to "🍭"
 )
 
 private const val SETTINGS_HOLD_MS = 3000
@@ -161,6 +164,14 @@ fun KidFriendlyApp() {
     var isPrinting by remember { mutableStateOf(false) }
     var selectedDeviceAddress by remember { mutableStateOf<String?>(null) }
     var hasBluetoothPermission by remember { mutableStateOf(false) }
+
+    // Gallery navigation: where "Back" returns to, which sticker is open, and a counter
+    // bumped whenever a new sticker is saved so the grid reloads.
+    var galleryReturnScreen by remember { mutableStateOf(AppScreen.HOME) }
+    var gallerySelected by remember { mutableStateOf<SavedSticker?>(null) }
+    var historyVersion by remember { mutableIntStateOf(0) }
+    // The transcribe/understand/draw work in flight, so Back can cancel it.
+    var workJob: Job? by remember { mutableStateOf(null) }
 
     // Audio recording state
     val audioRecorder = remember { AudioRecorder(context) }
@@ -219,6 +230,11 @@ fun KidFriendlyApp() {
         currentScreen = AppScreen.HOME
     }
 
+    /** Background work ended without a sticker: go home, unless the kid is browsing the gallery. */
+    fun abandonWork() {
+        if (currentScreen == AppScreen.GALLERY) galleryReturnScreen = AppScreen.HOME else goHome()
+    }
+
     fun handleFailure(e: Exception) {
         Log.e("KidFriendlyApp", "Sticker flow failed", e)
         if (e is GeminiApiException) {
@@ -226,29 +242,36 @@ fun KidFriendlyApp() {
         } else {
             tell("Oops! Something went wrong. Let's try again!")
         }
-        goHome()
+        abandonWork()
     }
 
     /** Draws [idea]; each call picks a new art style, so "Draw again" gives a fresh take. */
     fun generate(idea: StickerIdea) {
         currentIdea = idea
         currentScreen = AppScreen.GENERATING
-        coroutineScope.launch {
+        workJob = coroutineScope.launch {
             try {
                 val bitmap = ColoringBookGenerator.generateColoringPage(
                     apiKey = BuildConfig.GOOGLE_API_KEY,
                     userPrompt = idea.subject
                 )
-                if (currentScreen != AppScreen.GENERATING) return@launch // kid backed out
                 if (bitmap != null) {
                     generatedImage = bitmap
-                    currentScreen = AppScreen.RESULT
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    when {
+                        currentScreen == AppScreen.GENERATING -> currentScreen = AppScreen.RESULT
+                        // Kid peeked at the gallery while waiting: Back will show the new sticker.
+                        currentScreen == AppScreen.GALLERY && galleryReturnScreen == AppScreen.GENERATING ->
+                            galleryReturnScreen = AppScreen.RESULT
+                    }
                     StickerHistory.save(context, bitmap, idea.subject, idea.title)
+                    historyVersion++
                 } else {
                     tell("Oops! I couldn't draw that one. Let's try again!")
-                    goHome()
+                    abandonWork()
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 handleFailure(e)
             }
@@ -258,7 +281,7 @@ fun KidFriendlyApp() {
     val processAudio: (File) -> Unit = { file ->
         currentScreen = AppScreen.GENERATING
         currentIdea = null
-        coroutineScope.launch {
+        workJob = coroutineScope.launch {
             try {
                 val transcribedText = ColoringBookGenerator.transcribeAudio(
                     apiKey = BuildConfig.GOOGLE_API_KEY,
@@ -266,17 +289,13 @@ fun KidFriendlyApp() {
                 )
                 if (transcribedText.isNullOrBlank()) {
                     tell("I couldn't hear you. Tap the microphone and try again!")
-                    goHome()
+                    abandonWork()
                     return@launch
                 }
 
-                val idea = ColoringBookGenerator.interpretRequest(BuildConfig.GOOGLE_API_KEY, transcribedText)
-                if (!idea.understood) {
-                    tell(idea.reply)
-                    goHome()
-                    return@launch
-                }
-                generate(idea)
+                generate(StickerIdea(subject = transcribedText.trim()))
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 handleFailure(e)
             } finally {
@@ -359,7 +378,7 @@ fun KidFriendlyApp() {
 
     fun surpriseMe() {
         val (subject, _) = STICKER_IDEAS.random()
-        generate(StickerIdea(subject = subject, reply = "Surprise! Let's make $subject!", understood = true))
+        generate(StickerIdea(subject = subject))
     }
 
     fun print(bitmap: Bitmap) {
@@ -382,14 +401,40 @@ fun KidFriendlyApp() {
         }
     }
 
-    // Hardware/gesture back goes to the home screen instead of leaving the app.
-    BackHandler(enabled = currentScreen != AppScreen.HOME) {
-        if (currentScreen == AppScreen.RECORDING) {
-            recordingJob?.cancel()
-            audioRecorder.stopRecording()?.delete()
-        }
-        if (!isPrinting) goHome()
+    fun cancelRecording() {
+        recordingJob?.cancel()
+        audioRecorder.stopRecording()?.delete()
     }
+
+    fun openGallery() {
+        if (currentScreen == AppScreen.RECORDING) cancelRecording()
+        galleryReturnScreen = when (currentScreen) {
+            AppScreen.RESULT, AppScreen.GENERATING -> currentScreen
+            else -> AppScreen.HOME
+        }
+        gallerySelected = null
+        currentScreen = AppScreen.GALLERY
+    }
+
+    fun goBack() {
+        when (currentScreen) {
+            AppScreen.HOME -> Unit
+            AppScreen.RECORDING -> {
+                cancelRecording()
+                currentScreen = AppScreen.HOME
+            }
+            AppScreen.GENERATING -> {
+                workJob?.cancel()
+                currentScreen = AppScreen.HOME
+            }
+            AppScreen.RESULT -> currentScreen = AppScreen.HOME
+            AppScreen.GALLERY ->
+                if (gallerySelected != null) gallerySelected = null else currentScreen = galleryReturnScreen
+        }
+    }
+
+    // Hardware/gesture back does the same as the on-screen Back button instead of leaving the app.
+    BackHandler(enabled = currentScreen != AppScreen.HOME && !isPrinting) { goBack() }
 
     // Main UI
     Box(
@@ -405,11 +450,34 @@ fun KidFriendlyApp() {
                 )
             )
     ) {
+      Column(modifier = Modifier.fillMaxSize()) {
+        TopBar(
+            showBack = currentScreen != AppScreen.HOME,
+            showGallery = currentScreen != AppScreen.GALLERY,
+            enabled = !isPrinting,
+            onBack = { goBack() },
+            onGallery = { openGallery() },
+            trailing = {
+                // Settings: grown-ups must hold the gear for a few seconds so kids don't wander in.
+                if (currentScreen == AppScreen.HOME) {
+                    HoldToOpenButton(
+                        holdMillis = SETTINGS_HOLD_MS,
+                        onShortTap = { tell("Grown-ups: hold the gear for 3 seconds") },
+                        onOpen = {
+                            val intent = Intent(context, SettingsActivity::class.java)
+                            intent.putExtra("device_address", selectedDeviceAddress ?: PrinterPreferences.getSelectedDeviceAddress(context))
+                            context.startActivity(intent)
+                        }
+                    )
+                }
+            }
+        )
+
+        Box(modifier = Modifier.weight(1f)) {
         when (currentScreen) {
             AppScreen.HOME -> HomeScreen(
                 onMicrophoneClick = { onMicTapped() },
-                onSurpriseClick = { surpriseMe() },
-                onGalleryClick = { currentScreen = AppScreen.GALLERY }
+                onSurpriseClick = { surpriseMe() }
             )
 
             AppScreen.RECORDING -> RecordingScreen(
@@ -433,38 +501,104 @@ fun KidFriendlyApp() {
 
             AppScreen.GALLERY -> GalleryScreen(
                 isPrinting = isPrinting,
-                onPrint = { print(it) },
-                onBackClick = { goHome() }
+                historyVersion = historyVersion,
+                selected = gallerySelected,
+                onSelect = { gallerySelected = it },
+                onPrint = { print(it) }
             )
         }
-
-        // Settings: grown-ups must hold the gear for a few seconds so kids don't wander in.
-        if (currentScreen == AppScreen.HOME) {
-            HoldToOpenButton(
-                holdMillis = SETTINGS_HOLD_MS,
-                onShortTap = {
-                    coroutineScope.launch {
-                        snackbarHostState.currentSnackbarData?.dismiss()
-                        snackbarHostState.showSnackbar("Grown-ups: hold the gear for 3 seconds")
-                    }
-                },
-                onOpen = {
-                    val intent = Intent(context, SettingsActivity::class.java)
-                    intent.putExtra("device_address", selectedDeviceAddress ?: PrinterPreferences.getSelectedDeviceAddress(context))
-                    context.startActivity(intent)
-                },
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(12.dp)
-                    .padding(top = 28.dp)
-            )
         }
+      }
 
         SnackbarHost(
             hostState = snackbarHostState,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(16.dp)
+        )
+    }
+}
+
+/** Always-visible bar: Back on the left, "My stickers" (and the settings gear on home) on the right. */
+@Composable
+fun TopBar(
+    showBack: Boolean,
+    showGallery: Boolean,
+    enabled: Boolean,
+    onBack: () -> Unit,
+    onGallery: () -> Unit,
+    trailing: @Composable () -> Unit = {}
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp)
+            .padding(top = 20.dp, bottom = 4.dp)
+            .height(56.dp)
+    ) {
+        if (showBack) {
+            Box(modifier = Modifier.align(Alignment.CenterStart)) {
+                PillButton(
+                    icon = Icons.AutoMirrored.Filled.ArrowBack,
+                    label = "Back",
+                    color = SkyBlue,
+                    enabled = enabled,
+                    onClick = onBack
+                )
+            }
+        }
+        if (showGallery) {
+            // Centered when it's alone (home); pushed right when Back takes the left side,
+            // since both won't fit side by side with it centered on small phones.
+            Box(modifier = Modifier.align(if (showBack) Alignment.CenterEnd else Alignment.Center)) {
+                PillButton(
+                    icon = Icons.Default.Collections,
+                    label = "My stickers",
+                    color = OceanBlue,
+                    enabled = enabled,
+                    onClick = onGallery
+                )
+            }
+        }
+        Box(modifier = Modifier.align(Alignment.CenterEnd)) { trailing() }
+    }
+}
+
+@Composable
+fun PillButton(
+    icon: ImageVector,
+    label: String,
+    color: Color,
+    enabled: Boolean,
+    onClick: () -> Unit
+) {
+    val haptics = LocalHapticFeedback.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(if (isPressed) 0.92f else 1f, tween(100), label = "pillScale")
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .scale(scale)
+            .shadow(6.dp, RoundedCornerShape(50))
+            .background(if (enabled) color else color.copy(alpha = 0.5f), RoundedCornerShape(50))
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                enabled = enabled,
+                onClick = {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onClick()
+                }
+            )
+            .padding(horizontal = 16.dp, vertical = 10.dp)
+    ) {
+        Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(28.dp))
+        Spacer(modifier = Modifier.size(8.dp))
+        Text(
+            text = label,
+            color = Color.White,
+            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
         )
     }
 }
@@ -534,8 +668,7 @@ fun HoldToOpenButton(
 @Composable
 fun HomeScreen(
     onMicrophoneClick: () -> Unit,
-    onSurpriseClick: () -> Unit,
-    onGalleryClick: () -> Unit
+    onSurpriseClick: () -> Unit
 ) {
     val haptics = LocalHapticFeedback.current
     val interactionSource = remember { MutableInteractionSource() }
@@ -573,7 +706,7 @@ fun HomeScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 24.dp, vertical = 32.dp),
+            .padding(horizontal = 24.dp, vertical = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
@@ -593,7 +726,7 @@ fun HomeScreen(
             textAlign = TextAlign.Center
         )
 
-        Spacer(modifier = Modifier.height(40.dp))
+        Spacer(modifier = Modifier.height(28.dp))
 
         // Giant microphone button
         Box(
@@ -654,30 +787,17 @@ fun HomeScreen(
 
         Spacer(modifier = Modifier.height(32.dp))
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly
-        ) {
-            ActionButton(
-                icon = { Icon(Icons.Default.Casino, contentDescription = null, tint = Color.White, modifier = Modifier.size(40.dp)) },
-                label = "Surprise me!",
-                backgroundColor = MagicPurple,
-                enabled = true,
-                size = 80.dp,
-                onClick = {
-                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                    onSurpriseClick()
-                }
-            )
-            ActionButton(
-                icon = { Icon(Icons.Default.Collections, contentDescription = null, tint = Color.White, modifier = Modifier.size(40.dp)) },
-                label = "My stickers",
-                backgroundColor = OceanBlue,
-                enabled = true,
-                size = 80.dp,
-                onClick = onGalleryClick
-            )
-        }
+        ActionButton(
+            icon = { Icon(Icons.Default.Casino, contentDescription = null, tint = Color.White, modifier = Modifier.size(40.dp)) },
+            label = "Surprise me!",
+            backgroundColor = MagicPurple,
+            enabled = true,
+            size = 80.dp,
+            onClick = {
+                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                onSurpriseClick()
+            }
+        )
     }
 }
 
@@ -835,7 +955,7 @@ fun GeneratingScreen(idea: StickerIdea?) {
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Show what the AI understood so kids (and grown-ups) know what's coming.
+        // Show what was heard so kids (and grown-ups) know what's coming.
         Text(
             text = if (idea == null) "Listening to your idea…" else "Drawing ${idea.subject}",
             style = MaterialTheme.typography.titleLarge.copy(fontSize = subtitleTextSize, fontWeight = FontWeight.SemiBold),
@@ -910,8 +1030,6 @@ fun ResultScreen(
             .padding(horizontal = 24.dp, vertical = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(modifier = Modifier.height(32.dp))
-
         Text(
             text = "🎨 Your Sticker!",
             style = MaterialTheme.typography.displaySmall.copy(fontSize = titleTextSize),
@@ -1005,19 +1123,17 @@ private fun StickerImage(image: Bitmap, modifier: Modifier = Modifier) {
 @Composable
 fun GalleryScreen(
     isPrinting: Boolean,
-    onPrint: (Bitmap) -> Unit,
-    onBackClick: () -> Unit
+    historyVersion: Int,
+    selected: SavedSticker?,
+    onSelect: (SavedSticker) -> Unit,
+    onPrint: (Bitmap) -> Unit
 ) {
     val context = LocalContext.current
     val haptics = LocalHapticFeedback.current
-    val stickers by produceState<List<SavedSticker>?>(initialValue = null) {
+    val stickers by produceState<List<SavedSticker>?>(initialValue = null, historyVersion) {
         value = StickerHistory.list(context)
     }
-    var selected by remember { mutableStateOf<SavedSticker?>(null) }
     val titleTextSize = responsiveTextSize(MaterialTheme.typography.displaySmall.fontSize)
-
-    // Back from a single sticker returns to the grid.
-    BackHandler(enabled = selected != null && !isPrinting) { selected = null }
 
     Column(
         modifier = Modifier
@@ -1025,8 +1141,6 @@ fun GalleryScreen(
             .padding(horizontal = 16.dp, vertical = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(modifier = Modifier.height(32.dp))
-
         Text(
             text = "🖼️ My Stickers",
             style = MaterialTheme.typography.displaySmall.copy(fontSize = titleTextSize),
@@ -1081,30 +1195,15 @@ fun GalleryScreen(
                     items(stickers!!, key = { it.id }) { sticker ->
                         StickerThumbnail(sticker) {
                             haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                            selected = sticker
+                            onSelect(sticker)
                         }
                     }
                 }
             }
         }
 
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 24.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.Bottom
-        ) {
-            ActionButton(
-                icon = { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null, tint = Color.White, modifier = Modifier.size(40.dp)) },
-                label = "Back",
-                backgroundColor = SkyBlue,
-                enabled = !isPrinting,
-                size = 80.dp,
-                onClick = { if (current != null) selected = null else onBackClick() }
-            )
-
-            if (current != null) {
+        if (current != null) {
+            Box(modifier = Modifier.padding(bottom = 24.dp)) {
                 ActionButton(
                     icon = {
                         if (isPrinting) {
@@ -1209,7 +1308,7 @@ fun ActionButton(
 @Composable
 fun HomeScreenPreview() {
     StickerPrinterTheme {
-        HomeScreen(onMicrophoneClick = {}, onSurpriseClick = {}, onGalleryClick = {})
+        HomeScreen(onMicrophoneClick = {}, onSurpriseClick = {})
     }
 }
 
@@ -1225,6 +1324,6 @@ fun RecordingScreenPreview() {
 @Composable
 fun GeneratingScreenPreview() {
     StickerPrinterTheme {
-        GeneratingScreen(idea = StickerIdea("a dinosaur riding a skateboard", "", true))
+        GeneratingScreen(idea = StickerIdea("a dinosaur riding a skateboard"))
     }
 }
